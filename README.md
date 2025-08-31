@@ -1,40 +1,55 @@
-Estratégia para Resolução de Conflito de Dados (Offline-First)
-Cenário: Um usuário edita uma despesa no dispositivo A (offline), alterando seu valor. Antes que o dispositivo A possa sincronizar, o mesmo usuário deleta essa mesma despesa no dispositivo B (online), e essa exclusão é sincronizada com o servidor na nuvem.
+Estratégia para Resolução de Conflito de Dados (Offline vs. Online)
+1. Cenário do Conflito
+O conflito a ser resolvido é o seguinte:
 
-Estratégia Escolhida: "Last Write Wins" (Última Escrita Vence) com "Soft Delete" (Exclusão Lógica)
+Estado Inicial: Uma despesa "Almoço, R$25" existe no dispositivo local e na nuvem.
 
-Nossa estratégia combina duas abordagens para garantir consistência e preservar a intenção do usuário da forma mais segura possível.
+Ação Offline: O usuário, sem conexão com a internet, edita a despesa no dispositivo local para "Almoço, R$50".
 
-Soft Delete (Exclusão Lógica): Em vez de remover permanentemente um registro do banco de dados (DELETE FROM expenses...), nós adicionaríamos uma coluna is_deleted (ou deleted_at) à nossa tabela de despesas. Quando o usuário "deleta" uma despesa, nós apenas marcamos esse campo como true (ou preenchemos com a data/hora da exclusão). A aplicação então filtra e não exibe os itens marcados como deletados.
+Ação Online: Simultaneamente (ou antes da sincronização), o usuário exclui essa mesma despesa a partir de outro dispositivo que está online.
 
-Last Write Wins (Última Escrita Vence): Cada registro de despesa também teria uma coluna last_updated (ou updated_at) com um timestamp preciso de quando foi a última modificação. Quando o dispositivo A (offline) finalmente se conecta à internet para sincronizar, ele envia sua alteração (a edição do valor da despesa) junto com o timestamp daquela alteração.
+Momento da Sincronização: O dispositivo offline finalmente se conecta à internet e tenta sincronizar a sua alteração (a edição para R$50).
 
-Processo de Resolução do Conflito:
+O sistema precisa decidir o que fazer: a despesa deve ser restaurada com o novo valor ou deve permanecer excluída?
 
-Quando o servidor recebe a tentativa de atualização do dispositivo A, ele verifica o estado atual do registro no banco de dados central:
+2. Estratégia Escolhida: "A Exclusão Prevalece" (Server-side Wins on Deletion)
+A estratégia que eu adotaria como padrão para este cenário é dar prioridade à operação de exclusão. Quando o dispositivo offline tentar enviar a atualização, o servidor de sincronização detectará que o registro correspondente não existe mais (foi excluído) e instruirá o cliente a descartar a alteração local.
 
-O servidor vê que o registro já está marcado como is_deleted = true.
+Fluxo da Resolução:
 
-Ele compara o timestamp da exclusão (que veio do dispositivo B) com o timestamp da edição (que veio do dispositivo A).
+O cliente offline tenta enviar um UPDATE para a despesa com ID=XYZ, alterando seu valor para R$50.
 
-Seguindo a regra "Last Write Wins", a operação com o timestamp mais recente prevalece.
+O servidor recebe a requisição, mas ao procurar pelo registro com ID=XYZ, descobre que ele foi permanentemente excluído (ou marcado como "deletado").
 
-Neste cenário específico, a exclusão no dispositivo B provavelmente ocorreu depois da edição no dispositivo A (que estava offline). Portanto, a exclusão "vence". A edição do dispositivo A é descartada, e o servidor informa ao dispositivo A que o item foi, na verdade, excluído, para que a interface local seja atualizada e o item removido da lista.
+O servidor retorna uma resposta ao cliente, informando que o registro não existe mais (ex: um código de status 404 Not Found ou uma resposta específica de "conflito de exclusão").
 
-Prós desta Estratégia:
+O aplicativo cliente, ao receber essa resposta, entende o conflito e remove a despesa de seu banco de dados local para espelhar o estado do servidor.
 
-Simplicidade de Implementação: É uma das estratégias mais diretas para resolver conflitos, evitando lógicas complexas de fusão de dados.
+3. Justificativa, Prós e Contras
+Por que essa estratégia?
+A exclusão é, geralmente, uma ação com maior "intenção final" do que uma edição. Um usuário que deleta algo espera que aquilo desapareça permanentemente. Restaurar um item deletado sem a permissão explícita do usuário pode causar confusão e frustração, fazendo-o pensar que o aplicativo não é confiável. Essa abordagem preza pela consistência e previsibilidade, tratando o estado do servidor como a fonte da verdade em caso de conflitos destrutivos.
 
-Consistência Garantida: Sempre haverá um estado final claro e consistente para os dados em todos os dispositivos.
+Prós:
+Consistência dos Dados: Garante que o estado final dos dados seja consistente em todos os dispositivos, evitando que itens "fantasmas" reapareçam.
 
-Recuperação de Dados: O uso de "soft delete" permite que dados "excluídos" possam ser recuperados, se necessário, o que é uma grande vantagem em caso de exclusões acidentais.
+Previsibilidade para o Usuário: A ação de deletar é honrada. Se o usuário deletou, o item permanece deletado. Isso é o comportamento esperado na maioria dos casos.
 
-Contras desta Estratégia:
+Simplicidade de Implementação: É uma lógica de resolução de conflitos relativamente simples de implementar no backend. Não requer a intervenção do usuário, tornando o processo de sincronização mais rápido e automático.
 
-Perda de Dados Potencial: A principal desvantagem é que a edição feita pelo usuário no dispositivo A (offline) é perdida. O usuário pode ficar frustrado ao ver que seu trabalho foi descartado sem aviso.
+Contras:
+Perda Silenciosa de Dados (Principal Desvantagem): O usuário que fez a edição offline perderá seu trabalho (a alteração de R25paraR50) sem ser notificado. Ele pode abrir o app mais tarde e simplesmente não encontrar a despesa que editou, o que é uma péssima experiência do usuário.
 
-Não Considera a Intenção: A regra é baseada puramente em tempo, e não na "importância" da operação. Uma edição pode ter sido mais importante para o usuário do que a exclusão, mas o sistema não tem como saber.
+Falta de Contexto: A estratégia não leva em conta quando as ações ocorreram. A edição pode ter sido mais recente e mais importante que a exclusão, mas mesmo assim é descartada.
 
-Conclusão:
+4. Melhoria (Abordagem Híbrida)
+Para mitigar a principal desvantagem (perda silenciosa de dados), uma versão aprimorada desta estratégia seria:
 
-Apesar da potencial perda de dados, a combinação de "Last Write Wins" com "Soft Delete" é uma estratégia robusta e pragmática para uma aplicação como esta. Ela prioriza a consistência dos dados, que é crucial em um sistema financeiro, e oferece uma rede de segurança com a exclusão lógica. Para mitigar o contra, poderíamos implementar um sistema de notificação que informaria ao usuário: "A despesa 'Almoço' que você editou foi excluída em outro dispositivo e não pôde ser salva."
+O servidor ainda rejeita a atualização, mas retorna uma mensagem de conflito mais detalhada.
+
+O aplicativo cliente, em vez de apagar a despesa silenciosamente, armazena a alteração falha em uma área de "conflitos" ou "itens não sincronizados".
+
+O aplicativo exibe uma notificação para o usuário, algo como: "Não foi possível salvar a edição em 'Almoço', pois esta despesa foi excluída em outro dispositivo. [Ver detalhes]".
+
+O usuário pode então ver a alteração que foi perdida e decidir se quer recriar a despesa manualmente.
+
+Esta abordagem híbrida combina a robustez da "exclusão prevalece" com uma experiência de usuário muito melhor, pois informa sobre a perda de dados e dá ao usuário o poder de agir.
